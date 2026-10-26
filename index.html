@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111418">
+<meta name="mobile-web-app-capable" content="yes">
+<title>My Departures</title>
+<style>
+  :root {
+    --bg: #111418; --card: #1b2027; --text: #eef1f5; --muted: #8b95a3;
+    --line: #2a313b; --warn: #ffb020; --bad: #ff5a5a; --ok: #4cd07d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: max(12px, env(safe-area-inset-top)) 12px 24px;
+  }
+  header { display: flex; align-items: baseline; justify-content: space-between; margin: 4px 4px 12px; }
+  header h1 { font-size: 20px; margin: 0; }
+  #status { color: var(--muted); font-size: 13px; }
+  #status.err { color: var(--bad); }
+  .card { background: var(--card); border-radius: 14px; margin-bottom: 12px; overflow: hidden; }
+  .card h2 {
+    font-size: 15px; margin: 0; padding: 10px 14px; letter-spacing: .02em;
+    text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--line);
+    display: flex; justify-content: space-between; cursor: pointer; user-select: none;
+  }
+  .card.collapsed ul { display: none; }
+  .card.collapsed h2 { border-bottom: 0; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li {
+    display: grid; grid-template-columns: 44px 1fr auto; align-items: center; gap: 10px;
+    padding: 9px 14px; border-bottom: 1px solid var(--line);
+  }
+  li:last-child { border-bottom: 0; }
+  .badge {
+    font-weight: 800; font-size: 15px; text-align: center; border-radius: 8px;
+    padding: 4px 0; color: #fff; background: #555;
+  }
+  .badge.dark { color: #111; }
+  .dir { min-width: 0; }
+  .dir b { display: block; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dir small { color: var(--muted); font-size: 12px; }
+  .dir small .late { color: var(--warn); }
+  .min { font-size: 22px; font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; }
+  .min small { font-size: 12px; font-weight: 600; color: var(--muted); margin-left: 2px; }
+  .min.now { color: var(--ok); }
+  li.cancelled .dir b, li.cancelled .min { text-decoration: line-through; color: var(--bad); }
+  .empty { padding: 12px 14px; color: var(--muted); font-size: 14px; }
+  #setup { background: var(--card); border-radius: 14px; padding: 16px; }
+  #setup p { margin: 0 0 10px; color: var(--muted); font-size: 14px; }
+  #setup input {
+    width: 100%; padding: 12px; font-size: 16px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+  }
+  button {
+    margin-top: 10px; padding: 12px 16px; font-size: 16px; font-weight: 700;
+    border: 0; border-radius: 10px; background: #2f6fed; color: #fff; width: 100%;
+  }
+  footer { text-align: center; margin-top: 8px; }
+  footer a { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Departures</h1>
+  <span id="status"></span>
+</header>
+
+<div id="setup" hidden>
+  <p>Paste your Rejseplanen Labs access ID. It is stored only in this browser.</p>
+  <input id="keyInput" type="text" autocomplete="off" spellcheck="false" placeholder="accessId">
+  <button id="saveKey">Save</button>
+</div>
+
+<main id="board"></main>
+
+<footer><a href="#" id="changeKey" hidden>Change API key</a></footer>
+
+<script>
+// Stop IDs from Rejseplanen's GTFS stops.txt
+const STATIONS = [
+  { id: "000008603309", name: "Christianshavn (Metro)" },
+  { id: "000008600634", name: "Dybbølsbro" },
+  { id: "000008600955", name: "Kildedal" },
+  { id: "000008600709", name: "Måløv" },
+];
+const API = "https://www.rejseplanen.dk/api/departureBoard";
+const ROWS_PER_STATION = 6;
+const REFRESH_MS = 60_000;   // 4 stations x 1/min stays well inside the free quota while open
+const TICK_MS = 15_000;      // re-render countdowns between fetches
+const DEMO = new URLSearchParams(location.search).has("demo");
+
+// Official S-tog / Metro line colors; `dark` means use black text on the badge
+const LINE_COLORS = {
+  A: ["#0078c1"], B: ["#4cae31"], Bx: ["#a6cf39", true], C: ["#f39200"], E: ["#7b65aa"],
+  F: ["#ffc500", true], H: ["#e2001a"],
+  M1: ["#00814a"], M2: ["#ffc600", true], M3: ["#e60000"], M4: ["#00a2e1"],
+};
+
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+let data = {};          // station id -> { departures: [...], error }
+let lastFetch = null;
+let refreshTimer = null;
+
+function lineOf(d) {
+  const p = d.ProductAtStop || (Array.isArray(d.Product) ? d.Product[0] : d.Product) || {};
+  return (p.line || p.displayNumber || d.name || "?").replace(/^(S-tog|Metro)\s*/i, "").trim();
+}
+
+function cleanDirection(s) {
+  return (s || "").replace(/\s*\(Metro\)/i, "").replace(/\s+St\.?$/i, "");
+}
+
+function parseLocal(date, time) {
+  // API returns Danish local date/time, e.g. "2026-10-26" + "21:04:00"
+  const [y, m, d] = date.split("-").map(Number);
+  const [hh, mm, ss] = time.split(":").map(Number);
+  return new Date(y, m - 1, d, hh, mm, ss || 0);
+}
+
+function normalize(d) {
+  const planned = parseLocal(d.date, d.time);
+  const actual = d.rtTime ? parseLocal(d.rtDate || d.date, d.rtTime) : planned;
+  return {
+    line: lineOf(d),
+    direction: cleanDirection(d.direction),
+    planned, actual,
+    delayMin: Math.round((actual - planned) / 60000),
+    track: d.rtTrack || d.track || "",
+    cancelled: d.cancelled === true || d.cancelled === "true",
+    realtime: !!d.rtTime,
+  };
+}
+
+async function fetchStation(st, key) {
+  const url = `${API}?accessId=${encodeURIComponent(key)}&format=json&id=${st.id}&dur=60`;
+  const res = await fetch(url);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || json.errorCode) throw new Error(json.errorText || `HTTP ${res.status}`);
+  const list = json.Departure ? [].concat(json.Departure) : [];
+  return list.map(normalize);
+}
+
+function demoStation(st) {
+  const lines = {
+    "000008603309": [["M1", "Vanløse"], ["M1", "Vestamager"], ["M2", "Lufthavnen"], ["M2", "Vanløse"]],
+    "000008600634": [["A", "Hundige"], ["B", "Høje Taastrup"], ["C", "Klampenborg"], ["E", "Køge"], ["H", "Frederikssund"]],
+    "000008600955": [["C", "Klampenborg"], ["C", "Frederikssund"]],
+    "000008600709": [["C", "Klampenborg"], ["C", "Frederikssund"]],
+  }[st.id];
+  const now = Date.now();
+  return Array.from({ length: 8 }, (_, i) => {
+    const [line, direction] = lines[i % lines.length];
+    const planned = new Date(now + (i * 4 + 1) * 60000);
+    const delay = i === 2 ? 3 : 0;
+    return { line, direction, planned, actual: new Date(+planned + delay * 60000),
+             delayMin: delay, track: String((i % 2) + 1), cancelled: i === 5, realtime: true };
+  });
+}
+
+async function refresh() {
+  const key = store.get("rpKey");
+  if (!DEMO && !key) return showSetup();
+  setStatus("Updating…");
+  const results = await Promise.allSettled(
+    STATIONS.map((st) => DEMO ? Promise.resolve(demoStation(st)) : fetchStation(st, key))
+  );
+  let firstError = null;
+  results.forEach((r, i) => {
+    const id = STATIONS[i].id;
+    if (r.status === "fulfilled") data[id] = { departures: r.value };
+    else { data[id] = { departures: data[id]?.departures || [], error: r.reason.message }; firstError ??= r.reason.message; }
+  });
+  lastFetch = new Date();
+  render();
+  if (firstError) setStatus(firstError, true);
+}
+
+function setStatus(text, isErr = false) {
+  $("status").textContent = text;
+  $("status").className = isErr ? "err" : "";
+}
+
+function fmtTime(d) {
+  return d.toLocaleTimeString("da-DK", { hour: "2-digit", minute: "2-digit" });
+}
+
+function render() {
+  const now = Date.now();
+  const collapsed = JSON.parse(store.get("collapsed") || "[]");
+  $("board").innerHTML = STATIONS.map((st) => {
+    const deps = (data[st.id]?.departures || [])
+      .filter((d) => d.actual - now > -30_000)
+      .sort((a, b) => a.actual - b.actual)
+      .slice(0, ROWS_PER_STATION);
+    const rows = deps.map((d) => {
+      const mins = Math.max(0, Math.floor((d.actual - now) / 60000));
+      const [bg, dark] = LINE_COLORS[d.line] || ["#555"];
+      const late = d.delayMin > 0 ? ` <span class="late">+${d.delayMin}</span>` : "";
+      const track = d.track ? ` · track ${esc(d.track)}` : "";
+      const info = d.cancelled ? "Cancelled" : `${fmtTime(d.planned)}${late}${track}`;
+      const minHtml = mins === 0 ? "Now" : `${mins}<small>min</small>`;
+      return `<li class="${d.cancelled ? "cancelled" : ""}">
+        <span class="badge ${dark ? "dark" : ""}" style="background:${bg}">${esc(d.line)}</span>
+        <span class="dir"><b>${esc(d.direction)}</b><small>${info}</small></span>
+        <span class="min ${mins === 0 && !d.cancelled ? "now" : ""}">${minHtml}</span>
+      </li>`;
+    }).join("");
+    const body = rows || `<div class="empty">${esc(data[st.id]?.error || (lastFetch ? "No departures in the next hour" : "Loading…"))}</div>`;
+    const isCollapsed = collapsed.includes(st.id);
+    return `<section class="card ${isCollapsed ? "collapsed" : ""}" data-id="${st.id}">
+      <h2><span>${esc(st.name)}</span><span>${isCollapsed ? "▸" : "▾"}</span></h2>
+      <ul>${body}</ul>
+    </section>`;
+  }).join("");
+  if (lastFetch) setStatus(`Updated ${fmtTime(lastFetch)}${DEMO ? " · demo" : ""}`);
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function showSetup() {
+  $("setup").hidden = false;
+  $("board").hidden = true;
+  $("changeKey").hidden = true;
+  setStatus("");
+}
+
+function hideSetup() {
+  $("setup").hidden = true;
+  $("board").hidden = false;
+  $("changeKey").hidden = DEMO;
+}
+
+$("saveKey").onclick = () => {
+  const key = $("keyInput").value.trim();
+  if (!key) return;
+  store.set("rpKey", key);
+  hideSetup();
+  start();
+};
+
+$("changeKey").onclick = (e) => {
+  e.preventDefault();
+  $("keyInput").value = store.get("rpKey") || "";
+  showSetup();
+};
+
+$("board").onclick = (e) => {
+  const card = e.target.closest("h2") && e.target.closest(".card");
+  if (!card) return;
+  const collapsed = new Set(JSON.parse(store.get("collapsed") || "[]"));
+  collapsed.has(card.dataset.id) ? collapsed.delete(card.dataset.id) : collapsed.add(card.dataset.id);
+  store.set("collapsed", JSON.stringify([...collapsed]));
+  render();
+};
+
+function start() {
+  clearInterval(refreshTimer);
+  refresh();
+  refreshTimer = setInterval(refresh, REFRESH_MS);
+}
+
+// Only poll while the page is on screen, to save API quota
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) clearInterval(refreshTimer);
+  else if (DEMO || store.get("rpKey")) start();
+});
+
+setInterval(() => { if (lastFetch) render(); }, TICK_MS);
+
+if (DEMO || store.get("rpKey")) { hideSetup(); start(); } else showSetup();
+</script>
+</body>
+</html>
